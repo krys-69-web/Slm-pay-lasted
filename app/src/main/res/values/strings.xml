@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">SLM Play</string>
+    <string name="shortcut_private_space_short">Espace Privé</string>
+    <string name="shortcut_private_space_long">Accéder à l\'Espace Privé Sécurisé</string>
+</resources>

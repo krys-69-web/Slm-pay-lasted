@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="shortcut_private_space"
+        android:enabled="true"
+        android:icon="@drawable/ic_lock_vault"
+        android:shortcutShortLabel="@string/shortcut_private_space_short"
+        android:shortcutLongLabel="@string/shortcut_private_space_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aistudio.slmplay.musicaudio"
+            android:targetClass="com.example.MainActivity">
+            <extra android:name="open_private_space" android:value="true" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>
