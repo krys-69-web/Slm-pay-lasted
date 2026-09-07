@@ -6,6 +6,7 @@ import android.view.ViewGroup
 import android.webkit.*
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,6 +30,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -88,6 +90,7 @@ fun FullscreenBrowserScreen(
     val currentTab = tabs.find { it.id == activeTabId } ?: tabs.firstOrNull() ?: BrowserTab("tab_1", "Page d'accueil", "about:blank")
 
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    var lastRequestedUrl by remember(activeTabId) { mutableStateOf(currentTab.url) }
     var isImmersiveFullscreen by remember { mutableStateOf(false) }
     var showTabsSheet by remember { mutableStateOf(false) }
     var showBookmarksHistorySheet by remember { mutableStateOf(false) }
@@ -128,6 +131,7 @@ fun FullscreenBrowserScreen(
         }
 
         onUpdateUrlInput(formattedUrl)
+        lastRequestedUrl = formattedUrl
         val updatedTabs = tabs.map {
             if (it.id == activeTabId) it.copy(url = formattedUrl, title = formattedUrl) else it
         }
@@ -219,11 +223,42 @@ fun FullscreenBrowserScreen(
                                         }
                                     }
                                     if (isLoadingPage) {
-                                        IconButton(
-                                            onClick = { webViewInstance?.stopLoading() },
-                                            modifier = Modifier.size(28.dp)
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(AppleCrimson.copy(alpha = 0.15f))
+                                                .padding(start = 8.dp, end = 2.dp, top = 2.dp, bottom = 2.dp)
                                         ) {
-                                            Icon(Icons.Default.Close, contentDescription = "Arrêter", tint = AppleCrimson, modifier = Modifier.size(16.dp))
+                                            val infiniteTrans = rememberInfiniteTransition(label = "pulse_chip")
+                                            val pulseAlpha by infiniteTrans.animateFloat(
+                                                initialValue = 0.4f,
+                                                targetValue = 1f,
+                                                animationSpec = infiniteRepeatable(
+                                                    animation = tween(600, easing = FastOutSlowInEasing),
+                                                    repeatMode = RepeatMode.Reverse
+                                                ),
+                                                label = "alpha"
+                                            )
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(6.dp)
+                                                    .clip(CircleShape)
+                                                    .background(AppleCrimson.copy(alpha = pulseAlpha))
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                text = "$currentProgress%",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AppleCrimson
+                                            )
+                                            IconButton(
+                                                onClick = { webViewInstance?.stopLoading() },
+                                                modifier = Modifier.size(24.dp)
+                                            ) {
+                                                Icon(Icons.Default.Close, contentDescription = "Arrêter", tint = AppleCrimson, modifier = Modifier.size(14.dp))
+                                            }
                                         }
                                     } else {
                                         IconButton(
@@ -458,17 +493,78 @@ fun FullscreenBrowserScreen(
                         }
                     }
 
-                    // Loading Progress Indicator
-                    if (isLoadingPage && currentProgress in 1..99) {
-                        LinearProgressIndicator(
-                            progress = { currentProgress / 100f },
+                    // Premium Apple Glass Neon Loading Progress Bar
+                    val animatedProgress by animateFloatAsState(
+                        targetValue = if (isLoadingPage) (currentProgress / 100f).coerceIn(0.04f, 1f) else 1f,
+                        animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing),
+                        label = "web_progress"
+                    )
+
+                    val loaderInf = rememberInfiniteTransition(label = "loader_shimmer")
+                    val shimmerPhase by loaderInf.animateFloat(
+                        initialValue = 0f,
+                        targetValue = 1f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(1300, easing = LinearEasing),
+                            repeatMode = RepeatMode.Restart
+                        ),
+                        label = "shimmer_phase"
+                    )
+
+                    AnimatedVisibility(
+                        visible = isLoadingPage && currentProgress in 1..99,
+                        enter = fadeIn(tween(150)) + expandVertically(),
+                        exit = fadeOut(tween(350)) + shrinkVertically()
+                    ) {
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(2.5.dp)
-                                .padding(top = 4.dp),
-                            color = AppleCrimson,
-                            trackColor = Color.Transparent
-                        )
+                                .height(3.5.dp)
+                                .background(Color.White.copy(alpha = 0.05f))
+                        ) {
+                            // Dynamic Glowing Multi-Gradient Track
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(animatedProgress)
+                                    .background(
+                                        Brush.horizontalGradient(
+                                            colors = listOf(
+                                                AppleCrimson,
+                                                ApplePink,
+                                                ApplePurple,
+                                                AppleTeal
+                                            )
+                                        )
+                                    )
+                            )
+
+                            // Shimmer Specular Light Wave
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(animatedProgress)
+                                    .background(
+                                        Brush.horizontalGradient(
+                                            0.0f to Color.Transparent,
+                                            0.5f to Color.White.copy(alpha = 0.55f),
+                                            1.0f to Color.Transparent,
+                                            startX = shimmerPhase * 1200f - 300f,
+                                            endX = shimmerPhase * 1200f + 300f
+                                        )
+                                    )
+                            )
+
+                            // Glowing Beacon Head
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.CenterStart)
+                                    .offset(x = (LocalConfiguration.current.screenWidthDp.dp * animatedProgress) - 6.dp)
+                                    .size(width = 12.dp, height = 3.5.dp)
+                                    .shadow(elevation = 8.dp, shape = CircleShape, spotColor = AppleCrimson)
+                                    .background(Color.White, CircleShape)
+                            )
+                        }
                     }
                 }
             }
@@ -759,15 +855,24 @@ fun FullscreenBrowserScreen(
 
                             webViewInstance = wv
 
+                            wv.isNestedScrollingEnabled = true
+                            wv.overScrollMode = WebView.OVER_SCROLL_IF_CONTENT_SCROLLS
+                            wv.isVerticalScrollBarEnabled = true
+                            wv.isHorizontalScrollBarEnabled = true
+                            wv.isScrollbarFadingEnabled = true
+                            wv.scrollBarStyle = WebView.SCROLLBARS_INSIDE_OVERLAY
+
                             if (currentTab.url != "about:blank" && wv.url != currentTab.url) {
+                                lastRequestedUrl = currentTab.url
                                 wv.loadUrl(currentTab.url)
                             }
 
                             wv
                         },
                         update = { view ->
-                            // If url changed and not blank, load it
-                            if (currentTab.url != "about:blank" && view.url != currentTab.url) {
+                            // Load only when requested URL changes from outside, preventing reload jitter
+                            if (currentTab.url != "about:blank" && currentTab.url != lastRequestedUrl) {
+                                lastRequestedUrl = currentTab.url
                                 view.loadUrl(currentTab.url)
                             }
                         },

@@ -47,6 +47,14 @@ object WebSessionManager {
                     javaScriptCanOpenWindowsAutomatically = true
                 }
 
+                // Enable fluid nested scrolling and hardware acceleration
+                isNestedScrollingEnabled = true
+                isVerticalScrollBarEnabled = true
+                isHorizontalScrollBarEnabled = true
+                isScrollbarFadingEnabled = true
+                scrollBarStyle = WebView.SCROLLBARS_INSIDE_OVERLAY
+                overScrollMode = WebView.OVER_SCROLL_IF_CONTENT_SCROLLS
+
                 // Strictly preserve all cookies and third-party session tokens
                 val cookieManager = CookieManager.getInstance()
                 cookieManager.setAcceptCookie(true)
@@ -85,6 +93,14 @@ object WebSessionManager {
                     cacheMode = WebSettings.LOAD_NO_CACHE // Private mode
                     javaScriptCanOpenWindowsAutomatically = false
                 }
+
+                // Enable fluid nested scrolling and hardware acceleration
+                isNestedScrollingEnabled = true
+                isVerticalScrollBarEnabled = true
+                isHorizontalScrollBarEnabled = true
+                isScrollbarFadingEnabled = true
+                scrollBarStyle = WebView.SCROLLBARS_INSIDE_OVERLAY
+                overScrollMode = WebView.OVER_SCROLL_IF_CONTENT_SCROLLS
             }
         }
 

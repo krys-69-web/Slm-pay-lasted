@@ -20,6 +20,7 @@ import android.net.Uri
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import com.example.MainActivity
 import com.example.R
 import com.example.slmplay.data.db.TrackEntity
@@ -34,19 +35,36 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * MusicPlaybackService - High-Fidelity, Single-Instance Audio Service.
+ *
+ * ABSOLUTE RULE: Exactly one active audio instance plays at any given time.
+ * Overlapping audio, rapid-click race conditions, and dual-playback anomalies
+ * are strictly prohibited and architecturally prevented via atomic request counters
+ * and synchronous player teardown.
+ */
 class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPlayer.OnCompletionListener, MediaPlayer.OnErrorListener {
 
     private val binder = MusicBinder()
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
 
+    // Strict Single Instance Architecture
+    private val playbackLock = Any()
     private var mediaPlayer: MediaPlayer? = null
-    private var nextMediaPlayer: MediaPlayer? = null
+    private val playRequestId = AtomicLong(0L)
+    private var activePlayJob: Job? = null
+    private val isHandlingCompletion = AtomicBoolean(false)
+
     private var mediaSession: MediaSession? = null
     private lateinit var audioManager: AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var resumeOnFocusGain = false
     private val audioEffectManager = AudioEffectManager()
 
-    // State flows for clients
+    // State flows for UI and external components
     private val _currentTrack = MutableStateFlow<TrackEntity?>(null)
     val currentTrack = _currentTrack.asStateFlow()
 
@@ -62,7 +80,7 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     private val _isBuffering = MutableStateFlow(false)
     val isBuffering = _isBuffering.asStateFlow()
 
-    // Real-time audio reactivity for visualizer
+    // Real-time audio reactivity for visualizers
     private val _audioAmplitudes = MutableStateFlow(FloatArray(16) { 0.2f })
     val audioAmplitudes = _audioAmplitudes.asStateFlow()
 
@@ -78,7 +96,7 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     private var isShuffle: Boolean = false
     private var isSmartShuffle: Boolean = true
     private var isGaplessEnabled: Boolean = true
-    private var isCrossfadeEnabled: Boolean = true
+    private var isCrossfadeEnabled: Boolean = false
     private var crossfadeDurationSec: Int = 3
     private var playbackSpeed: Float = 1.0f
 
@@ -101,9 +119,9 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     private val recentPlayedHistory = mutableListOf<String>()
 
     private var progressTrackingJob: Job? = null
-    private var crossfadeJob: Job? = null
 
     companion object {
+        private const val TAG = "SLMPlaybackService"
         const val CHANNEL_ID = "slm_play_music_channel"
         const val NOTIFICATION_ID = 1001
 
@@ -195,57 +213,130 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
 
     private fun getArtworkBitmap(track: TrackEntity): Bitmap? {
         return try {
-            val resId = when (track.coverResName) {
-                "cover_neon" -> R.drawable.cover_neon
-                "cover_ambient" -> R.drawable.cover_ambient
-                else -> R.drawable.slm_logo
+            if (!track.coverUri.isNullOrBlank()) {
+                val uri = Uri.parse(track.coverUri)
+                contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream)
+                }
+            } else {
+                val resId = when (track.coverResName) {
+                    "cover_neon" -> R.drawable.cover_neon
+                    "cover_ambient" -> R.drawable.cover_ambient
+                    else -> R.drawable.slm_logo
+                }
+                BitmapFactory.decodeResource(resources, resId)
             }
-            BitmapFactory.decodeResource(resources, resId)
         } catch (e: Exception) {
-            null
+            try {
+                BitmapFactory.decodeResource(resources, R.drawable.slm_logo)
+            } catch (e2: Exception) {
+                null
+            }
         }
     }
 
-    fun playTrack(track: TrackEntity, queue: List<TrackEntity> = listOf(track), index: Int = 0, applyCrossfade: Boolean = true) {
-        playlistQueue = queue
-        currentQueueIndex = if (index in queue.indices) index else queue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-        _currentTrack.value = track
-        _isBuffering.value = true
+    // ==========================================
+    // ATOMIC SINGLE INSTANCE PLAYBACK ENGINE
+    // ==========================================
+
+    /**
+     * Strictly plays a single track.
+     * Guaranteed:
+     * 1. Stops & releases previous player immediately.
+     * 2. Supersedes any concurrent/rapid taps with an atomic generation ID.
+     * 3. Prepares and starts exactly one MediaPlayer.
+     */
+    fun playTrack(
+        track: TrackEntity,
+        queue: List<TrackEntity> = listOf(track),
+        index: Int = 0,
+        applyCrossfade: Boolean = false
+    ) {
+        val requestId = playRequestId.incrementAndGet()
+
+        // 1. Synchronously stop and release existing player immediately
+        synchronized(playbackLock) {
+            activePlayJob?.cancel()
+            releaseMediaPlayerInternal()
+            _isPlaying.value = false
+            _isBuffering.value = true
+            _currentPosition.value = 0L
+            _duration.value = if (track.durationMs > 0) track.durationMs else 0L
+            _currentTrack.value = track
+            playlistQueue = queue
+            currentQueueIndex = if (index in queue.indices) index else queue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+        }
 
         recentPlayedHistory.add(track.id)
-        if (recentPlayedHistory.size > 20) recentPlayedHistory.removeAt(0)
+        if (recentPlayedHistory.size > 25) recentPlayedHistory.removeAt(0)
 
-        serviceScope.launch {
+        // 2. Launch single isolated load job
+        activePlayJob = serviceScope.launch(Dispatchers.Main) {
             try {
-                if (applyCrossfade && isCrossfadeEnabled && mediaPlayer != null && _isPlaying.value) {
-                    performCrossfadeTransition(track)
-                    return@launch
-                }
+                if (requestId != playRequestId.get() || !isActive) return@launch
 
-                releaseMediaPlayer()
-
-                val player = MediaPlayer().apply {
+                val newPlayer = MediaPlayer().apply {
                     setAudioAttributes(
                         AudioAttributes.Builder()
                             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .build()
                     )
-                    setOnPreparedListener(this@MusicPlaybackService)
-                    setOnCompletionListener(this@MusicPlaybackService)
-                    setOnErrorListener(this@MusicPlaybackService)
                 }
 
-                setPlayerDataSource(player, track)
+                setPlayerDataSource(newPlayer, track)
 
-                mediaPlayer = player
-                player.prepareAsync()
+                if (requestId != playRequestId.get() || !isActive) {
+                    safeReleasePlayer(newPlayer)
+                    return@launch
+                }
 
-                updateMediaSessionMetadata(track)
-                showNotification(track, isPlaying = true)
+                newPlayer.setOnErrorListener(this@MusicPlaybackService)
+                newPlayer.setOnCompletionListener(this@MusicPlaybackService)
+                newPlayer.setOnPreparedListener { preparedMp ->
+                    serviceScope.launch(Dispatchers.Main) {
+                        if (requestId != playRequestId.get() || !isActive) {
+                            safeReleasePlayer(preparedMp)
+                            return@launch
+                        }
+
+                        synchronized(playbackLock) {
+                            mediaPlayer = preparedMp
+
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                try {
+                                    val params = preparedMp.playbackParams
+                                    params.speed = playbackSpeed
+                                    preparedMp.playbackParams = params
+                                } catch (e: Exception) {
+                                    // ignore
+                                }
+                            }
+
+                            val playerDur = preparedMp.duration.toLong()
+                            val dur = if (playerDur > 0) playerDur else if (track.durationMs > 0) track.durationMs else 180000L
+                            _duration.value = dur
+
+                            requestAudioFocus()
+                            preparedMp.start()
+
+                            _isPlaying.value = true
+                            _isBuffering.value = false
+
+                            audioEffectManager.attachToAudioSession(preparedMp.audioSessionId)
+                        }
+
+                        updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING)
+                        updateMediaSessionMetadata(track)
+                        showNotification(track, isPlaying = true)
+                    }
+                }
+
+                newPlayer.prepareAsync()
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e(TAG, "Error starting playback for track: ${track.title}", e)
                 _isBuffering.value = false
+                _isPlaying.value = false
             }
         }
     }
@@ -276,182 +367,98 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
                 player.setDataSource(fallbackFile.absolutePath)
             }
         } catch (e: Exception) {
-            e.printStackTrace()
-            try {
-                val fallbackFile = ProceduralAudioGenerator.getOrCreateAudioFile(this, "synthwave")
-                player.setDataSource(fallbackFile.absolutePath)
-            } catch (fallbackEx: Exception) {
-                fallbackEx.printStackTrace()
-            }
-        }
-    }
-
-    private fun performCrossfadeTransition(nextTrack: TrackEntity) {
-        crossfadeJob?.cancel()
-        crossfadeJob = serviceScope.launch {
-            val oldPlayer = mediaPlayer
-            val steps = 15
-            val stepDelay = ((crossfadeDurationSec * 1000L) / steps).coerceIn(40L, 200L)
-
-            val newPlayer = MediaPlayer().apply {
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .build()
-                )
-                setOnCompletionListener(this@MusicPlaybackService)
-                setOnErrorListener(this@MusicPlaybackService)
-            }
-            setPlayerDataSource(newPlayer, nextTrack)
-            newPlayer.prepare()
-            newPlayer.setVolume(0f, 0f)
-            newPlayer.start()
-
-            // Attach effects to new player
-            audioEffectManager.attachToAudioSession(newPlayer.audioSessionId)
-
-            mediaPlayer = newPlayer
-            _isBuffering.value = false
-            _isPlaying.value = true
-            _duration.value = newPlayer.duration.toLong().coerceAtLeast(180000L)
-            updateMediaSessionMetadata(nextTrack)
-            showNotification(nextTrack, isPlaying = true)
-
-            for (i in 1..steps) {
-                val progress = i.toFloat() / steps
-                try {
-                    oldPlayer?.setVolume(1f - progress, 1f - progress)
-                    newPlayer.setVolume(progress, progress)
-                } catch (e: Exception) {
-                    // ignore
-                }
-                delay(stepDelay)
-            }
-
-            try {
-                oldPlayer?.stop()
-                oldPlayer?.release()
-            } catch (e: Exception) {
-                // ignore
-            }
+            Log.w(TAG, "Could not open data source: ${track.uriString}, falling back to generator", e)
+            val fallbackFile = ProceduralAudioGenerator.getOrCreateAudioFile(this, "synthwave")
+            player.setDataSource(fallbackFile.absolutePath)
         }
     }
 
     override fun onPrepared(mp: MediaPlayer?) {
-        _isBuffering.value = false
-        mp?.let {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                try {
-                    val params = it.playbackParams
-                    params.speed = playbackSpeed
-                    it.playbackParams = params
-                } catch (e: Exception) {
-                    // Ignore
-                }
-            }
-            _duration.value = it.duration.toLong().coerceAtLeast(180000L)
-            it.start()
-            _isPlaying.value = true
-
-            // Attach audio effect manager
-            audioEffectManager.attachToAudioSession(it.audioSessionId)
-
-            // Setup gapless next player if enabled
-            if (isGaplessEnabled && playlistQueue.isNotEmpty()) {
-                setupGaplessNextPlayer()
-            }
-
-            updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING)
-            _currentTrack.value?.let { track ->
-                showNotification(track, isPlaying = true)
-            }
-        }
-    }
-
-    private fun setupGaplessNextPlayer() {
-        serviceScope.launch(Dispatchers.Main) {
-            try {
-                val nextIdx = (currentQueueIndex + 1) % playlistQueue.size
-                if (nextIdx in playlistQueue.indices && nextIdx != currentQueueIndex) {
-                    val nextTrack = playlistQueue[nextIdx]
-                    nextMediaPlayer?.release()
-                    val nextPlayer = MediaPlayer().apply {
-                        setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .build()
-                        )
-                    }
-                    nextMediaPlayer = nextPlayer
-                    setPlayerDataSource(nextPlayer, nextTrack)
-                    nextPlayer.prepareAsync()
-                    nextPlayer.setOnPreparedListener { nextMp ->
-                        try {
-                            mediaPlayer?.setNextMediaPlayer(nextMp)
-                        } catch (e: Exception) {
-                            // ignore
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
+        // Handled directly inside the prepared listener with request validation
     }
 
     fun resume() {
-        mediaPlayer?.let {
-            if (!it.isPlaying) {
-                it.start()
-                _isPlaying.value = true
-                updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING)
-                _currentTrack.value?.let { track ->
-                    showNotification(track, isPlaying = true)
+        val track = _currentTrack.value ?: return // If no track selected, Play does nothing
+        synchronized(playbackLock) {
+            mediaPlayer?.let { player ->
+                try {
+                    if (!player.isPlaying) {
+                        requestAudioFocus()
+                        player.start()
+                        _isPlaying.value = true
+                        updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING)
+                        showNotification(track, isPlaying = true)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to resume existing player, restarting track cleanly", e)
+                    playTrack(track, playlistQueue, currentQueueIndex)
                 }
+            } ?: run {
+                playTrack(track, playlistQueue, currentQueueIndex)
             }
-        } ?: run {
-            _currentTrack.value?.let { playTrack(it, playlistQueue, currentQueueIndex) }
         }
     }
 
     fun pause() {
-        mediaPlayer?.let {
-            if (it.isPlaying) {
-                it.pause()
-                _isPlaying.value = false
-                updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED)
-                _currentTrack.value?.let { track ->
-                    showNotification(track, isPlaying = false)
+        synchronized(playbackLock) {
+            mediaPlayer?.let { player ->
+                try {
+                    if (player.isPlaying) {
+                        player.pause()
+                    }
+                } catch (e: Exception) {
+                    // ignore
                 }
+            }
+            _isPlaying.value = false
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED)
+            _currentTrack.value?.let { track ->
+                showNotification(track, isPlaying = false)
             }
         }
     }
 
     fun togglePlayPause() {
-        if (_isPlaying.value) pause() else resume()
+        if (_currentTrack.value == null && mediaPlayer == null) {
+            // Requirement: "Si aucun morceau n'est sélectionné, Play ne doit rien lancer."
+            return
+        }
+        if (_isPlaying.value) {
+            pause()
+        } else {
+            resume()
+        }
     }
 
     fun seekTo(positionMs: Long) {
-        mediaPlayer?.let {
-            val target = positionMs.coerceIn(0, _duration.value)
-            it.seekTo(target.toInt())
-            _currentPosition.value = target
-            updateMediaSessionPlaybackState(if (_isPlaying.value) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED)
+        synchronized(playbackLock) {
+            mediaPlayer?.let { player ->
+                try {
+                    val target = positionMs.coerceIn(0, _duration.value)
+                    player.seekTo(target.toInt())
+                    _currentPosition.value = target
+                    updateMediaSessionPlaybackState(
+                        if (_isPlaying.value) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
+                    )
+                } catch (e: Exception) {
+                    // ignore
+                }
+            }
         }
     }
 
     fun setPlaybackSpeed(speed: Float) {
         playbackSpeed = speed
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            mediaPlayer?.let {
-                try {
-                    val params = it.playbackParams
-                    params.speed = speed
-                    it.playbackParams = params
-                } catch (e: Exception) {
-                    e.printStackTrace()
+            synchronized(playbackLock) {
+                mediaPlayer?.let { player ->
+                    try {
+                        val params = player.playbackParams
+                        params.speed = speed
+                        player.playbackParams = params
+                    } catch (e: Exception) {
+                        // ignore
+                    }
                 }
             }
         }
@@ -496,7 +503,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         }
 
         val insertIndex = (currentQueueIndex + 1).coerceIn(0, currentList.size)
-        // Check if track is already in queue elsewhere
         val existingIndex = currentList.indexOfFirst { it.id == track.id }
         if (existingIndex >= 0) {
             currentList.removeAt(existingIndex)
@@ -504,10 +510,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         val adjustedInsertIndex = (currentQueueIndex + 1).coerceIn(0, currentList.size)
         currentList.add(adjustedInsertIndex, track)
         playlistQueue = currentList
-
-        if (isGaplessEnabled) {
-            setupGaplessNextPlayer()
-        }
     }
 
     fun addToQueue(track: TrackEntity) {
@@ -516,7 +518,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
             playTrack(track, listOf(track), 0)
             return
         }
-        // Avoid duplicate immediately next if needed or append at end
         val existingIndex = currentList.indexOfFirst { it.id == track.id }
         if (existingIndex >= 0) {
             currentList.removeAt(existingIndex)
@@ -543,16 +544,11 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         currentList.add(toIndex, item)
         playlistQueue = currentList
 
-        // Recompute current queue index
         if (currentTrackItem != null) {
             val newIdx = currentList.indexOfFirst { it.id == currentTrackItem.id }
             if (newIdx >= 0) {
                 currentQueueIndex = newIdx
             }
-        }
-
-        if (isGaplessEnabled) {
-            setupGaplessNextPlayer()
         }
     }
 
@@ -561,7 +557,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         val currentList = playlistQueue.toMutableList()
 
         if (index == currentQueueIndex) {
-            // If removing currently playing track
             if (currentList.size <= 1) {
                 pause()
                 playlistQueue = emptyList()
@@ -581,10 +576,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
             }
             playlistQueue = currentList
         }
-
-        if (isGaplessEnabled) {
-            setupGaplessNextPlayer()
-        }
     }
 
     fun clearQueueExceptCurrent() {
@@ -596,8 +587,23 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
             playlistQueue = emptyList()
             currentQueueIndex = -1
         }
-        nextMediaPlayer?.release()
-        nextMediaPlayer = null
+    }
+
+    /**
+     * Updates metadata for currently playing track and its representation in queue.
+     */
+    fun updateCurrentTrackIfMatching(updated: TrackEntity) {
+        if (_currentTrack.value?.id == updated.id) {
+            _currentTrack.value = updated
+            updateMediaSessionMetadata(updated)
+            showNotification(updated, isPlaying = _isPlaying.value)
+        }
+        val idx = playlistQueue.indexOfFirst { it.id == updated.id }
+        if (idx != -1) {
+            val list = playlistQueue.toMutableList()
+            list[idx] = updated
+            playlistQueue = list
+        }
     }
 
     fun setQueue(newQueue: List<TrackEntity>, newIndex: Int) {
@@ -605,7 +611,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         currentQueueIndex = newIndex.coerceIn(0, (newQueue.size - 1).coerceAtLeast(0))
     }
 
-    // Smart Shuffle Selector
     fun skipToNext() {
         if (playlistQueue.isEmpty()) return
 
@@ -628,13 +633,10 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         if (playlistQueue.size <= 1) return 0
         val current = _currentTrack.value
 
-        // Candidates excluding current track
         val candidates = playlistQueue.indices.filter { it != currentQueueIndex }
-        // Avoid recent played tracks
         val unplayedRecently = candidates.filter { !recentPlayedHistory.contains(playlistQueue[it].id) }
         val pool = if (unplayedRecently.isNotEmpty()) unplayedRecently else candidates
 
-        // Prioritize different artist to avoid consecutive artist repeats
         val diffArtist = pool.filter { current == null || playlistQueue[it].artist != current.artist }
         val finalPool = if (diffArtist.isNotEmpty()) diffArtist else pool
 
@@ -655,40 +657,59 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         }
     }
 
+    /**
+     * Guarantees that track completion is processed exactly once per track finish.
+     * Prevents double-triggering of next track.
+     */
     override fun onCompletion(mp: MediaPlayer?) {
-        if (sleepTimerEndOnTrack) {
-            stopSleepTimerAndFadeOut()
-            return
-        }
+        if (mp == null || mp != mediaPlayer) return
+        if (!isHandlingCompletion.compareAndSet(false, true)) return
 
-        when (repeatMode) {
-            RepeatMode.ONE -> {
-                seekTo(0)
-                resume()
-            }
-            RepeatMode.ALL -> {
-                skipToNext()
-            }
-            RepeatMode.OFF -> {
-                if (currentQueueIndex + 1 < playlistQueue.size) {
-                    skipToNext()
-                } else {
-                    _isPlaying.value = false
-                    seekTo(0)
-                    updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED)
-                    _currentTrack.value?.let { showNotification(it, isPlaying = false) }
+        serviceScope.launch(Dispatchers.Main) {
+            try {
+                if (sleepTimerEndOnTrack) {
+                    stopSleepTimerAndFadeOut()
+                    return@launch
                 }
+
+                when (repeatMode) {
+                    RepeatMode.ONE -> {
+                        seekTo(0)
+                        resume()
+                    }
+                    RepeatMode.ALL -> {
+                        skipToNext()
+                    }
+                    RepeatMode.OFF -> {
+                        if (currentQueueIndex + 1 < playlistQueue.size) {
+                            skipToNext()
+                        } else {
+                            _isPlaying.value = false
+                            seekTo(0)
+                            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED)
+                            _currentTrack.value?.let { showNotification(it, isPlaying = false) }
+                        }
+                    }
+                }
+            } finally {
+                delay(300)
+                isHandlingCompletion.set(false)
             }
         }
     }
 
     override fun onError(mp: MediaPlayer?, what: Int, extra: Int): Boolean {
+        Log.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
         _isBuffering.value = false
         _isPlaying.value = false
+        safeReleasePlayer(mp)
         return true
     }
 
-    // Sleep Timer Support
+    // ==========================================
+    // SLEEP TIMER SUPPORT
+    // ==========================================
+
     fun startSleepTimer(minutes: Int, endOnCurrentTrack: Boolean = false) {
         sleepTimerJob?.cancel()
         sleepTimerEndOnTrack = endOnCurrentTrack
@@ -708,66 +729,157 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
                 seconds--
                 _sleepTimerSecondsLeft.value = seconds
 
-                // Gentle progressive volume fadeout in last 25 seconds
-                if (seconds <= 25) {
-                    val vol = (seconds.toFloat() / 25f).coerceIn(0.05f, 1f)
+                if (seconds <= 5 && seconds > 0) {
+                    // Gentle fade out at the end
                     try {
+                        val vol = seconds / 5f
                         mediaPlayer?.setVolume(vol, vol)
                     } catch (e: Exception) {
                         // ignore
                     }
                 }
             }
-            stopSleepTimerAndFadeOut()
+
+            if (isActive) {
+                pause()
+                try {
+                    mediaPlayer?.setVolume(1.0f, 1.0f)
+                } catch (e: Exception) {
+                    // ignore
+                }
+                _sleepTimerSecondsLeft.value = 0L
+            }
         }
     }
 
     fun cancelSleepTimer() {
         sleepTimerJob?.cancel()
-        sleepTimerJob = null
         sleepTimerEndOnTrack = false
         _sleepTimerSecondsLeft.value = 0L
         try {
-            mediaPlayer?.setVolume(1f, 1f)
+            mediaPlayer?.setVolume(1.0f, 1.0f)
         } catch (e: Exception) {
             // ignore
         }
     }
 
     private fun stopSleepTimerAndFadeOut() {
-        pause()
-        _sleepTimerSecondsLeft.value = 0L
-        sleepTimerEndOnTrack = false
-        try {
-            mediaPlayer?.setVolume(1f, 1f)
-        } catch (e: Exception) {
-            // ignore
+        serviceScope.launch {
+            for (i in 5 downTo 1) {
+                try {
+                    mediaPlayer?.setVolume(i / 5f, i / 5f)
+                } catch (e: Exception) {
+                    // ignore
+                }
+                delay(200)
+            }
+            pause()
+            try {
+                mediaPlayer?.setVolume(1.0f, 1.0f)
+            } catch (e: Exception) {
+                // ignore
+            }
+            cancelSleepTimer()
         }
     }
+
+    // ==========================================
+    // AUDIO FOCUS MANAGEMENT
+    // ==========================================
+
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                resumeOnFocusGain = false
+                pause()
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                resumeOnFocusGain = _isPlaying.value
+                pause()
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                try {
+                    mediaPlayer?.setVolume(0.2f, 0.2f)
+                } catch (e: Exception) {
+                    // ignore
+                }
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                try {
+                    mediaPlayer?.setVolume(1.0f, 1.0f)
+                } catch (e: Exception) {
+                    // ignore
+                }
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false
+                    resume()
+                }
+            }
+        }
+    }
+
+    private fun requestAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val playbackAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(playbackAttributes)
+                .setAcceptsDelayedFocusGain(true)
+                .setOnAudioFocusChangeListener(audioFocusListener)
+                .build()
+            audioFocusRequest?.let { audioManager.requestAudioFocus(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                audioFocusListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(audioFocusListener)
+        }
+    }
+
+    // ==========================================
+    // PROGRESS TRACKER & NOTIFICATION
+    // ==========================================
 
     private fun startProgressTracker() {
         progressTrackingJob?.cancel()
         progressTrackingJob = serviceScope.launch {
             while (isActive) {
-                if (_isPlaying.value && mediaPlayer != null) {
-                    try {
-                        val current = mediaPlayer?.currentPosition?.toLong() ?: 0L
-                        _currentPosition.value = current
-                        val dur = mediaPlayer?.duration?.toLong() ?: 0L
-                        if (dur > 0 && dur != _duration.value) {
-                            _duration.value = dur
-                        }
+                if (_isPlaying.value) {
+                    synchronized(playbackLock) {
+                        mediaPlayer?.let { player ->
+                            try {
+                                val current = player.currentPosition.toLong()
+                                _currentPosition.value = current
+                                val dur = player.duration.toLong()
+                                if (dur > 0 && dur != _duration.value) {
+                                    _duration.value = dur
+                                }
 
-                        // Generate reactive audio amplitudes for visualizers
-                        val amps = FloatArray(16)
-                        val posNorm = (current % 2000).toFloat() / 2000f
-                        for (i in amps.indices) {
-                            val wave = Math.sin((posNorm * Math.PI * 4) + (i * 0.4)).toFloat()
-                            amps[i] = (0.25f + Math.abs(wave) * 0.75f).coerceIn(0.1f, 1.0f)
+                                // Reactive audio amplitudes for visualizer
+                                val amps = FloatArray(16)
+                                val posNorm = (current % 2000).toFloat() / 2000f
+                                for (i in amps.indices) {
+                                    val wave = Math.sin((posNorm * Math.PI * 4) + (i * 0.4)).toFloat()
+                                    amps[i] = (0.25f + Math.abs(wave) * 0.75f).coerceIn(0.1f, 1.0f)
+                                }
+                                _audioAmplitudes.value = amps
+                            } catch (e: Exception) {
+                                // ignore
+                            }
                         }
-                        _audioAmplitudes.value = amps
-                    } catch (e: Exception) {
-                        // ignore
                     }
                 }
                 delay(120)
@@ -847,24 +959,56 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         return START_NOT_STICKY
     }
 
-    private fun releaseMediaPlayer() {
+    private fun releaseMediaPlayerInternal() {
+        mediaPlayer?.let { player ->
+            try {
+                player.setOnPreparedListener(null)
+                player.setOnCompletionListener(null)
+                player.setOnErrorListener(null)
+                if (player.isPlaying) {
+                    player.stop()
+                }
+            } catch (e: Exception) {
+                // ignore
+            }
+            try {
+                player.reset()
+                player.release()
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+        mediaPlayer = null
+        audioEffectManager.release()
+    }
+
+    private fun safeReleasePlayer(player: MediaPlayer?) {
         try {
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
+            player?.setOnPreparedListener(null)
+            player?.setOnCompletionListener(null)
+            player?.setOnErrorListener(null)
+            if (player?.isPlaying == true) {
+                player.stop()
+            }
+            player?.reset()
+            player?.release()
         } catch (e: Exception) {
             // ignore
         }
-        mediaPlayer = null
-        nextMediaPlayer?.release()
-        nextMediaPlayer = null
-        audioEffectManager.release()
+    }
+
+    private fun releaseMediaPlayer() {
+        synchronized(playbackLock) {
+            releaseMediaPlayerInternal()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         progressTrackingJob?.cancel()
         sleepTimerJob?.cancel()
-        crossfadeJob?.cancel()
+        activePlayJob?.cancel()
+        abandonAudioFocus()
         releaseMediaPlayer()
         mediaSession?.release()
         mediaSession = null

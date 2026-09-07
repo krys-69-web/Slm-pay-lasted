@@ -35,7 +35,7 @@ object BiometricAuthPromptHelper {
             )
             resCred == BiometricManager.BIOMETRIC_SUCCESS
         } catch (e: Exception) {
-            true // Allow attempting system authentication prompt
+            false
         }
     }
 

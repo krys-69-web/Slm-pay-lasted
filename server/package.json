@@ -1,0 +1,15 @@
+{
+  "name": "slm-play-ai-server",
+  "version": "1.0.0",
+  "description": "Backend API Server for SLM Play OpenAI Assistant and Musical Intelligence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

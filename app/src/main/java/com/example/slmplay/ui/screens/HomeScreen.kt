@@ -1,6 +1,7 @@
 package com.example.slmplay.ui.screens
 
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -239,6 +240,48 @@ fun HomeScreen(
         statusMessage?.let {
             snackbarHostState.showSnackbar(it)
             onClearStatusMessage()
+        }
+    }
+
+    val shouldInterceptBack = isFullPlayerOpen ||
+        isQueueOpen ||
+        isFullscreenVisualizerOpen ||
+        isEqualizerOpen ||
+        isSettingsOpen ||
+        isArtworkStudioOpen ||
+        isAudioEditorOpen ||
+        isMediaConverterOpen ||
+        isCreatePlaylistOpen ||
+        isAddToPlaylistOpen ||
+        isCloudHubOpen ||
+        selectedPlaylist != null ||
+        isAlbumDetailOpen ||
+        searchQuery.isNotBlank() ||
+        showBgMenu ||
+        pagerState.currentPage != 0
+
+    BackHandler(enabled = shouldInterceptBack) {
+        when {
+            showBgMenu -> showBgMenu = false
+            isFullscreenVisualizerOpen -> onCloseFullscreenVisualizer()
+            isQueueOpen -> onCloseQueue()
+            isFullPlayerOpen -> onCloseFullPlayer()
+            isEqualizerOpen -> onCloseEqualizer()
+            isSettingsOpen -> onCloseSettings()
+            isArtworkStudioOpen -> onCloseArtworkStudio()
+            isAudioEditorOpen -> onCloseAudioEditor()
+            isMediaConverterOpen -> onCloseMediaConverter()
+            isCreatePlaylistOpen -> onCloseCreatePlaylist()
+            isAddToPlaylistOpen -> onCloseAddToPlaylist()
+            isCloudHubOpen -> onCloseCloudHub()
+            isAlbumDetailOpen -> onCloseAlbumDetail()
+            selectedPlaylist != null -> onSelectPlaylist(null)
+            searchQuery.isNotBlank() -> onSearchQueryChange("")
+            pagerState.currentPage != 0 -> {
+                coroutineScope.launch {
+                    pagerState.animateScrollToPage(0)
+                }
+            }
         }
     }
 
@@ -661,6 +704,7 @@ fun HomeScreen(
                 // Horizontal Pager: Page 0 = Accueil / Bibliothèque, Page 1 = Web, Page 2 = Studio, Page 3 = À venir
                 HorizontalPager(
                     state = pagerState,
+                    userScrollEnabled = pagerState.currentPage != 1,
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)

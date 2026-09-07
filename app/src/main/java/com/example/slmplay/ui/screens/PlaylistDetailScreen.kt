@@ -1,5 +1,6 @@
 package com.example.slmplay.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -61,6 +62,18 @@ fun PlaylistDetailScreen(
     var isMultiSelectMode by remember { mutableStateOf(false) }
     val selectedTrackIds = remember { mutableStateListOf<String>() }
     var showAddSongsDialog by remember { mutableStateOf(false) }
+
+    BackHandler {
+        when {
+            showAddSongsDialog -> showAddSongsDialog = false
+            showMenu -> showMenu = false
+            isMultiSelectMode -> {
+                isMultiSelectMode = false
+                selectedTrackIds.clear()
+            }
+            else -> onBack()
+        }
+    }
 
     Box(modifier = modifier.fillMaxSize()) {
         LazyColumn(

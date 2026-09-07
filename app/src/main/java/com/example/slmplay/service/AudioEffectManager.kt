@@ -11,6 +11,13 @@ class AudioEffectManager {
     private var bassBoost: BassBoost? = null
     private var virtualizer: Virtualizer? = null
 
+    // Persisted audio effect settings across track transitions
+    private var isEffectEnabled: Boolean = true
+    private var currentPreset: String = "Bass Boost"
+    private val manualBandsState = mutableListOf(0f, 0f, 0f, 0f, 0f)
+    private var currentBassBoostFraction: Float = 0.5f
+    private var currentVirtualizerFraction: Float = 0.3f
+
     val presetNames = listOf(
         "Bass Boost",
         "Vocal",
@@ -28,13 +35,26 @@ class AudioEffectManager {
 
         try {
             equalizer = Equalizer(0, audioSessionId).apply {
-                enabled = true
+                enabled = isEffectEnabled
             }
             bassBoost = BassBoost(0, audioSessionId).apply {
-                enabled = true
+                enabled = isEffectEnabled
             }
             virtualizer = Virtualizer(0, audioSessionId).apply {
-                enabled = true
+                enabled = isEffectEnabled
+            }
+
+            // Immediately reapply stored preset & equalization curve
+            if (isEffectEnabled) {
+                if (currentPreset == "Manuel") {
+                    manualBandsState.forEachIndexed { index, gain ->
+                        applyManualBandInternal(index, gain)
+                    }
+                } else {
+                    applyPresetInternal(currentPreset)
+                }
+                setBassBoostInternal(currentBassBoostFraction)
+                setVirtualizerInternal(currentVirtualizerFraction)
             }
         } catch (e: Exception) {
             Log.e("AudioEffectManager", "Failed to init audio effects: ${e.message}")
@@ -42,6 +62,7 @@ class AudioEffectManager {
     }
 
     fun setEqualizerEnabled(enabled: Boolean) {
+        isEffectEnabled = enabled
         try {
             equalizer?.enabled = enabled
             bassBoost?.enabled = enabled
@@ -52,6 +73,11 @@ class AudioEffectManager {
     }
 
     fun applyPreset(presetName: String) {
+        currentPreset = presetName
+        applyPresetInternal(presetName)
+    }
+
+    private fun applyPresetInternal(presetName: String) {
         val eq = equalizer ?: return
         try {
             val numBands = eq.numberOfBands.toInt()
@@ -91,6 +117,17 @@ class AudioEffectManager {
     }
 
     fun setManualBand(bandIndex: Int, dbGain: Float) {
+        if (bandIndex in 0 until manualBandsState.size) {
+            manualBandsState[bandIndex] = dbGain
+        } else if (bandIndex >= manualBandsState.size) {
+            while (manualBandsState.size <= bandIndex) manualBandsState.add(0f)
+            manualBandsState[bandIndex] = dbGain
+        }
+        currentPreset = "Manuel"
+        applyManualBandInternal(bandIndex, dbGain)
+    }
+
+    private fun applyManualBandInternal(bandIndex: Int, dbGain: Float) {
         val eq = equalizer ?: return
         try {
             if (bandIndex < eq.numberOfBands) {
@@ -106,6 +143,11 @@ class AudioEffectManager {
     }
 
     fun setBassBoost(strengthFraction: Float) {
+        currentBassBoostFraction = strengthFraction
+        setBassBoostInternal(strengthFraction)
+    }
+
+    private fun setBassBoostInternal(strengthFraction: Float) {
         try {
             val s = (strengthFraction.coerceIn(0f, 1f) * 1000).toInt().toShort()
             bassBoost?.setStrength(s)
@@ -115,6 +157,11 @@ class AudioEffectManager {
     }
 
     fun setVirtualizer(strengthFraction: Float) {
+        currentVirtualizerFraction = strengthFraction
+        setVirtualizerInternal(strengthFraction)
+    }
+
+    private fun setVirtualizerInternal(strengthFraction: Float) {
         try {
             val s = (strengthFraction.coerceIn(0f, 1f) * 1000).toInt().toShort()
             virtualizer?.setStrength(s)

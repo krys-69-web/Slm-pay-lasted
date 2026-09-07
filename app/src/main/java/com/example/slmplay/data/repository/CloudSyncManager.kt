@@ -1,12 +1,14 @@
 package com.example.slmplay.data.repository
 
 import android.content.Context
+import android.net.Uri
 import com.example.slmplay.data.db.MusicDao
 import com.example.slmplay.data.db.PlaylistEntity
 import com.example.slmplay.data.db.PlaylistTrackCrossRef
 import com.example.slmplay.data.db.TrackEntity
 import com.example.slmplay.data.model.*
 import com.example.slmplay.utils.SecurityAuthHelper
+import com.example.slmplay.utils.StoragePersistenceManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -570,23 +572,32 @@ class CloudSyncManager(
 
     fun updateCloudProfile(username: String, avatarUri: String?) {
         val current = _cloudAccount.value ?: return
-        val updated = current.copy(
-            username = username.trim(),
-            avatarUri = avatarUri
-        )
-        _cloudAccount.value = updated
-        _savedCloudAccounts.value = _savedCloudAccounts.value.map {
-            if (it.cloudUserId == updated.cloudUserId) updated else it
-        }
-        saveAccountsToStorage()
+        scope.launch {
+            val persistentAvatar = if (!avatarUri.isNullOrBlank()) {
+                val uri = Uri.parse(avatarUri)
+                StoragePersistenceManager.persistImage(context, uri, "avatars", current.cloudUserId) ?: avatarUri
+            } else {
+                avatarUri
+            }
 
-        // Sync with server db
-        val serverDb = _serverUsersDb.value.map {
-            if (it.cloudUserId == updated.cloudUserId) {
-                it.copy(username = updated.username, avatarUri = updated.avatarUri)
-            } else it
+            val updated = current.copy(
+                username = username.trim(),
+                avatarUri = persistentAvatar
+            )
+            _cloudAccount.value = updated
+            _savedCloudAccounts.value = _savedCloudAccounts.value.map {
+                if (it.cloudUserId == updated.cloudUserId) updated else it
+            }
+            saveAccountsToStorage()
+
+            // Sync with server db
+            val serverDb = _serverUsersDb.value.map {
+                if (it.cloudUserId == updated.cloudUserId) {
+                    it.copy(username = updated.username, avatarUri = updated.avatarUri)
+                } else it
+            }
+            saveServerUsersDatabase(serverDb)
         }
-        saveServerUsersDatabase(serverDb)
     }
 
     fun toggleAutoSync(enabled: Boolean) {

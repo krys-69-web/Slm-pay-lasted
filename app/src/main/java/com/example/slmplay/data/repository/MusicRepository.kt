@@ -10,6 +10,7 @@ import com.example.slmplay.data.db.MusicDao
 import com.example.slmplay.data.db.PlaylistEntity
 import com.example.slmplay.data.db.PlaylistTrackCrossRef
 import com.example.slmplay.data.db.TrackEntity
+import com.example.slmplay.utils.StoragePersistenceManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -126,6 +127,16 @@ class MusicRepository(
         val imported = mutableListOf<TrackEntity>()
         val resolver: ContentResolver = context.contentResolver
 
+        // Load existing track signatures to prevent duplicate imports
+        val existingTracks = try {
+            musicDao.getTracksByOwnerDirect(userId)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        val existingSignatures = existingTracks.map {
+            "${it.title.trim().lowercase()}_${it.artist.trim().lowercase()}_${it.durationMs / 1000}"
+        }.toMutableSet()
+
         uris.forEach { uri ->
             try {
                 var displayName = "Morceau ${imported.size + 1}"
@@ -138,21 +149,47 @@ class MusicRepository(
                 }
 
                 val cleanTitle = displayName.substringBeforeLast(".")
+                val trackId = "import_" + UUID.randomUUID().toString()
+
+                // Extract real metadata first to test duplicate
+                val meta = StoragePersistenceManager.extractFullMetadata(
+                    context = context,
+                    audioUri = uri,
+                    fallbackTitle = cleanTitle,
+                    trackId = trackId
+                )
+
+                val signature = "${meta.title.trim().lowercase()}_${meta.artist.trim().lowercase()}_${meta.durationMs / 1000}"
+                if (signature in existingSignatures) {
+                    return@forEach
+                }
+                existingSignatures.add(signature)
+
+                // Persist audio file to internal storage so it is never lost or permission-expired
+                val persistentAudioUri = StoragePersistenceManager.persistAudioFile(
+                    context = context,
+                    sourceUri = uri,
+                    trackId = trackId,
+                    suggestedName = displayName
+                )
 
                 val track = TrackEntity(
-                    id = "import_" + UUID.randomUUID().toString(),
+                    id = trackId,
                     userId = userId,
-                    title = cleanTitle,
-                    artist = "Fichier importé",
-                    album = "Importations",
-                    durationMs = 210000L,
-                    uriString = uri.toString(),
+                    title = meta.title,
+                    artist = meta.artist,
+                    album = meta.album,
+                    durationMs = meta.durationMs,
+                    uriString = persistentAudioUri,
+                    coverUri = meta.embeddedCoverUri,
                     isFavorite = false,
                     isProcedural = false,
-                    genre = "Import local",
-                    originalTitle = cleanTitle,
-                    originalArtist = "Fichier importé",
-                    originalAlbum = "Importations"
+                    genre = meta.genre,
+                    year = meta.year,
+                    originalTitle = meta.title,
+                    originalArtist = meta.artist,
+                    originalAlbum = meta.album,
+                    originalCoverUri = meta.embeddedCoverUri
                 )
                 imported.add(track)
             } catch (e: Exception) {
@@ -165,6 +202,10 @@ class MusicRepository(
         }
 
         imported.size
+    }
+
+    suspend fun getTrackById(id: String): TrackEntity? = withContext(Dispatchers.IO) {
+        musicDao.getTrackById(id)
     }
 
     suspend fun insertCustomTrack(track: TrackEntity) = withContext(Dispatchers.IO) {
@@ -180,7 +221,13 @@ class MusicRepository(
         year: Int,
         coverUri: String?
     ) = withContext(Dispatchers.IO) {
-        musicDao.updateTrackMetadata(id, title, artist, album, genre, year, coverUri)
+        val persistentCover = if (!coverUri.isNullOrBlank()) {
+            val uri = Uri.parse(coverUri)
+            StoragePersistenceManager.persistImage(context, uri, "covers", id) ?: coverUri
+        } else {
+            coverUri
+        }
+        musicDao.updateTrackMetadata(id, title, artist, album, genre, year, persistentCover)
     }
 
     suspend fun restoreTrackMetadata(id: String) = withContext(Dispatchers.IO) {

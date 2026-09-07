@@ -19,6 +19,7 @@ import com.example.slmplay.data.repository.MusicRepository
 import com.example.slmplay.service.MusicPlaybackService
 import com.example.slmplay.utils.DynamicArtworkExtractor
 import com.example.slmplay.utils.SecurityVaultManager
+import com.example.slmplay.utils.StoragePersistenceManager
 import com.example.slmplay.utils.UniversalDownloadManager
 import com.example.slmplay.utils.WebSessionManager
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -103,10 +104,38 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _isPinLockScreenVisible = MutableStateFlow(false)
     val isPinLockScreenVisible = _isPinLockScreenVisible.asStateFlow()
 
-    private val _isAppLaunchLocked = MutableStateFlow(
-        securityVaultManager.isLockOnAppLaunchEnabled() && securityVaultManager.isPinConfigured()
-    )
+    private val _isAppLaunchLocked = MutableStateFlow(false)
     val isAppLaunchLocked = _isAppLaunchLocked.asStateFlow()
+
+    private val _isUpdateDialogOpen = MutableStateFlow(false)
+    val isUpdateDialogOpen = _isUpdateDialogOpen.asStateFlow()
+
+    private val _isAiAssistantOpen = MutableStateFlow(false)
+    val isAiAssistantOpen = _isAiAssistantOpen.asStateFlow()
+
+    fun openUpdateDialog() {
+        _isUpdateDialogOpen.value = true
+    }
+
+    fun closeUpdateDialog() {
+        _isUpdateDialogOpen.value = false
+    }
+
+    fun openAiAssistant() {
+        _isAiAssistantOpen.value = true
+    }
+
+    fun closeAiAssistant() {
+        _isAiAssistantOpen.value = false
+    }
+
+    fun setLockOnAppLaunch(enabled: Boolean) {
+        securityVaultManager.setLockOnAppLaunchEnabled(enabled)
+    }
+
+    fun setBiometricEnabled(enabled: Boolean) {
+        securityVaultManager.setBiometricEnabled(enabled)
+    }
 
     fun openPinLockForPrivateSpace() {
         _isPinLockScreenVisible.value = true
@@ -788,14 +817,56 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         coverUri: String?
     ) {
         viewModelScope.launch {
-            repository.updateTrackMetadata(id, title, artist, album, genre, year, coverUri)
-            _statusMessage.value = "Métadonnées mises à jour avec succès"
+            var persistentCoverUri = coverUri
+            if (coverUri != null && coverUri.startsWith("content://")) {
+                try {
+                    val persisted = StoragePersistenceManager.persistImage(
+                        context = getApplication(),
+                        sourceUri = Uri.parse(coverUri),
+                        category = "covers",
+                        itemId = id
+                    )
+                    if (persisted != null) {
+                        persistentCoverUri = persisted
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("MusicViewModel", "Could not persist cover URI", e)
+                }
+            }
+
+            repository.updateTrackMetadata(id, title, artist, album, genre, year, persistentCoverUri)
+            val current = currentTrack.value
+            if (current != null && current.id == id) {
+                val updated = current.copy(
+                    title = title,
+                    artist = artist,
+                    album = album,
+                    genre = genre,
+                    year = year,
+                    coverUri = persistentCoverUri
+                )
+                currentTrack.value = updated
+                playbackService?.updateCurrentTrackIfMatching(updated)
+                if (_appSettings.value.isDynamicArtworkEnabled) {
+                    val palette = DynamicArtworkExtractor.extractPalette(
+                        getApplication(),
+                        persistentCoverUri,
+                        updated.coverResName
+                    )
+                    _dynamicArtworkPalette.value = palette
+                }
+            }
+            _statusMessage.value = "Pochette et métadonnées appliquées instantanément"
         }
     }
 
     fun restoreTrackMetadata(id: String) {
         viewModelScope.launch {
             repository.restoreTrackMetadata(id)
+            val restoredTrack = repository.getTrackById(id)
+            if (restoredTrack != null && currentTrack.value?.id == id) {
+                playbackService?.updateCurrentTrackIfMatching(restoredTrack)
+            }
             _statusMessage.value = "Informations originales restaurées"
         }
     }

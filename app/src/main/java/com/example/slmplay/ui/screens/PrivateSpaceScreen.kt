@@ -11,6 +11,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -26,8 +27,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -355,16 +358,78 @@ fun PrivateSpaceScreen(
                             }
                         }
 
-                        // Progress Indicator
-                        if (isWebLoading) {
-                            LinearProgressIndicator(
-                                progress = { webProgress },
+                        // Premium Neon Glass Progress Indicator
+                        val animatedWebProgress by animateFloatAsState(
+                            targetValue = if (isWebLoading) webProgress.coerceIn(0.04f, 1f) else 1f,
+                            animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing),
+                            label = "private_web_progress"
+                        )
+
+                        val pShimmer = rememberInfiniteTransition(label = "private_loader_shimmer")
+                        val shimmerPhase by pShimmer.animateFloat(
+                            initialValue = 0f,
+                            targetValue = 1f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(1300, easing = LinearEasing),
+                                repeatMode = RepeatMode.Restart
+                            ),
+                            label = "shimmer_phase"
+                        )
+
+                        AnimatedVisibility(
+                            visible = isWebLoading && webProgress < 1f,
+                            enter = fadeIn(tween(150)) + expandVertically(),
+                            exit = fadeOut(tween(350)) + shrinkVertically()
+                        ) {
+                            Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(2.dp),
-                                color = accent,
-                                trackColor = Color.Transparent
-                            )
+                                    .height(3.5.dp)
+                                    .background(Color.White.copy(alpha = 0.05f))
+                            ) {
+                                // Dynamic Glowing Multi-Gradient Track
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .fillMaxWidth(animatedWebProgress)
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                colors = listOf(
+                                                    accent,
+                                                    Color(0xFF38EF7D),
+                                                    Color(0xFF00C6FF),
+                                                    Color(0xFF9D50BB)
+                                                )
+                                            )
+                                        )
+                                )
+
+                                // Shimmer Specular Light Wave
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .fillMaxWidth(animatedWebProgress)
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                0.0f to Color.Transparent,
+                                                0.5f to Color.White.copy(alpha = 0.55f),
+                                                1.0f to Color.Transparent,
+                                                startX = shimmerPhase * 1200f - 300f,
+                                                endX = shimmerPhase * 1200f + 300f
+                                            )
+                                        )
+                                )
+
+                                // Glowing Beacon Head
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.CenterStart)
+                                        .offset(x = (LocalConfiguration.current.screenWidthDp.dp * animatedWebProgress) - 6.dp)
+                                        .size(width = 12.dp, height = 3.5.dp)
+                                        .shadow(elevation = 8.dp, shape = CircleShape, spotColor = accent)
+                                        .background(Color.White, CircleShape)
+                                )
+                            }
                         }
 
                         // Isolated Private WebView
@@ -407,7 +472,19 @@ fun PrivateSpaceScreen(
                                 if (wv.url.isNullOrBlank() || wv.url == "about:blank") {
                                     wv.loadUrl(currentWebUrl)
                                 }
+
+                                wv.isNestedScrollingEnabled = true
+                                wv.overScrollMode = WebView.OVER_SCROLL_IF_CONTENT_SCROLLS
+                                wv.isVerticalScrollBarEnabled = true
+                                wv.isHorizontalScrollBarEnabled = true
+                                wv.isScrollbarFadingEnabled = true
+                                wv.scrollBarStyle = WebView.SCROLLBARS_INSIDE_OVERLAY
                                 wv
+                            },
+                            update = { view ->
+                                if (currentWebUrl.isNotBlank() && currentWebUrl != "about:blank" && view.url != currentWebUrl) {
+                                    view.loadUrl(currentWebUrl)
+                                }
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -611,19 +688,23 @@ fun PrivateSpaceScreen(
 
                         // Anti-Screenshot (FLAG_SECURE) Switch
                         item {
+                            val isEmulator = remember { securityVaultManager.isRunningOnEmulator() }
                             var antiScreenshot by remember {
                                 mutableStateOf(securityVaultManager.isAntiScreenshotEnabled())
                             }
                             SecurityToggleCard(
                                 title = "Anti-Capture d'Écran (FLAG_SECURE)",
-                                subtitle = "Bloque captures d'écran et prévisualisations multitâche",
+                                subtitle = if (isEmulator)
+                                    "Protection désactivée sur émulateur pour éviter l'écran noir en streaming"
+                                else
+                                    "Bloque captures d'écran et prévisualisations multitâche",
                                 icon = Icons.Default.VisibilityOff,
-                                isChecked = antiScreenshot,
+                                isChecked = antiScreenshot && !isEmulator,
                                 onCheckedChange = {
                                     antiScreenshot = it
                                     securityVaultManager.setAntiScreenshotEnabled(it)
                                     val window = (context as? Activity)?.window
-                                    if (it) {
+                                    if (it && !isEmulator) {
                                         window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                                     } else {
                                         window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
